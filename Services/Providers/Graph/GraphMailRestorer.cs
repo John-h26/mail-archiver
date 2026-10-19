@@ -3,8 +3,10 @@ using MailArchiver.Models;
 using MailArchiver.Services.Shared;
 using MailArchiver.Utilities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using Microsoft.Graph;
 using Microsoft.Graph.Models;
+using Microsoft.Graph.Users.Item.Messages.Item.Attachments.CreateUploadSession;
 
 namespace MailArchiver.Services.Providers.Graph
 {
@@ -14,25 +16,67 @@ namespace MailArchiver.Services.Providers.Graph
     /// </summary>
     public class GraphMailRestorer
     {
+        /// <summary>
+        /// Largest attachment sent inline with a plain POST. Graph rejects requests above 4 MB and
+        /// the payload is base64 encoded (4/3 overhead), so Microsoft documents 3 MB as the limit
+        /// for the simple path. Anything larger has to go through an upload session.
+        /// </summary>
+        internal const long SimpleAttachmentMaxBytes = 3_000_000;
+
+        /// <summary>
+        /// Slice size for upload sessions. Graph requires a multiple of 320 KiB and caps a single
+        /// request at 4 MB; ten slices of 320 KiB (3.125 MiB) stays safely below that.
+        /// </summary>
+        internal const int UploadSliceSize = 320 * 1024 * 10;
+
+        /// <summary>PidTagMessageFlags bit MSGFLAG_READ.</summary>
+        private const int MsgFlagRead = 0x1;
+
         private readonly GraphAuthClientFactory _authFactory;
         private readonly IGraphFolderService _folderService;
         private readonly MailArchiverDbContext _context;
         private readonly ILogger<GraphMailRestorer> _logger;
         private readonly DateTimeHelper _dateTimeHelper;
+        private readonly OffloadOptions _offloadOptions;
 
         public GraphMailRestorer(
             GraphAuthClientFactory authFactory,
             IGraphFolderService folderService,
             MailArchiverDbContext context,
             ILogger<GraphMailRestorer> logger,
-            DateTimeHelper dateTimeHelper)
+            DateTimeHelper dateTimeHelper,
+            IOptions<OffloadOptions> offloadOptions)
         {
             _authFactory = authFactory;
             _folderService = folderService;
             _context = context;
             _logger = logger;
             _dateTimeHelper = dateTimeHelper;
+            _offloadOptions = offloadOptions.Value;
         }
+
+        /// <summary>
+        /// Whether an attachment of the given size must be uploaded through an upload session
+        /// instead of a single POST.
+        /// </summary>
+        internal static bool RequiresUploadSession(long sizeInBytes) => sizeInBytes > SimpleAttachmentMaxBytes;
+
+        /// <summary>
+        /// The PidTagMessageFlags value for a restored, non-draft message. MSGFLAG_UNSENT is never
+        /// set, so Exchange treats the item as received mail; MSGFLAG_READ follows the requested
+        /// read state so it cannot contradict <see cref="Message.IsRead"/>.
+        /// </summary>
+        internal static string BuildMessageFlags(bool markAsRead) => (markAsRead ? MsgFlagRead : 0).ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+        /// <summary>
+        /// The delivery time stamped on a restored message: the topmost Received header when the
+        /// archive holds one, otherwise the send time. Same rule as the IMAP INTERNALDATE, so a
+        /// mailbox restored to M365 and one restored to IMAP sort identically by arrival.
+        /// </summary>
+        internal string ResolveDeliveryTimeUtcIso8601(ArchivedEmail email)
+            => InternalDateResolver.Resolve(email, _dateTimeHelper)
+                .UtcDateTime
+                .ToString("yyyy-MM-ddTHH:mm:ss.fffZ", System.Globalization.CultureInfo.InvariantCulture);
 
         /// <summary>
         /// Restores a single archived email to a specific folder in the target M365 mailbox.
@@ -128,6 +172,7 @@ namespace MailArchiver.Services.Providers.Graph
                 // itself generates, so a restored message roundtrips to the same canonical id.
                 var restorableMessageId = MailContentHelper.ToRestorableMessageId(email.MessageId);
                 var internetMessageId = string.IsNullOrEmpty(restorableMessageId) ? null : "<" + restorableMessageId + ">";
+                var markAsRead = _offloadOptions.MarkAsSeen;
 
                 var message = new Message
                 {
@@ -151,15 +196,18 @@ namespace MailArchiver.Services.Providers.Graph
                     SentDateTime = email.SentDate,
                     ReceivedDateTime = email.SentDate,
                     InternetMessageId = internetMessageId,
-                    IsRead = false,
+                    // Same switch as the IMAP path (Offload:MarkAsSeen, default true), so both
+                    // providers restore with the same read state. Previously IsRead=false was sent
+                    // together with MSGFLAG_READ, two contradicting instructions.
+                    IsRead = markAsRead,
                     Importance = Importance.Normal,
                     InferenceClassification = InferenceClassificationType.Focused,
                     SingleValueExtendedProperties = new List<SingleValueLegacyExtendedProperty>
                     {
                         new SingleValueLegacyExtendedProperty
                         {
-                            Id = "Integer 0x0E07", // PidTagMessageFlags
-                            Value = "1" // Mark as not a draft (MSGFLAG_READ)
+                            Id = "Integer 0x0E07", // PidTagMessageFlags: no MSGFLAG_UNSENT -> not a draft
+                            Value = BuildMessageFlags(markAsRead)
                         },
                         new SingleValueLegacyExtendedProperty
                         {
@@ -168,8 +216,8 @@ namespace MailArchiver.Services.Providers.Graph
                         },
                         new SingleValueLegacyExtendedProperty
                         {
-                            Id = "SystemTime 0x0E06", // PidTagMessageDeliveryTime
-                            Value = NormalizeToUtcIso8601(email.SentDate)
+                            Id = "SystemTime 0x0E06", // PidTagMessageDeliveryTime -> ReceivedDateTime
+                            Value = ResolveDeliveryTimeUtcIso8601(email)
                         }
                     }
                 };
@@ -187,7 +235,15 @@ namespace MailArchiver.Services.Providers.Graph
 
                     if (email.Attachments != null && email.Attachments.Any())
                     {
-                        await RestoreAttachmentsAsync(graphClient, email, targetAccount, createdMessage.Id);
+                        var attachmentsRestored = await RestoreAttachmentsAsync(graphClient, email, targetAccount, createdMessage.Id!);
+                        if (!attachmentsRestored)
+                        {
+                            // A message without its attachments must not be counted as restored.
+                            // Remove the partial copy so a retry starts clean instead of leaving a
+                            // second, incomplete message next to the complete one.
+                            await DeletePartialMessageAsync(graphClient, targetAccount, createdMessage.Id!, email.Id);
+                            return false;
+                        }
                     }
 
                     _logger.LogInformation("Successfully restored email {EmailId} to folder {FolderName} via Graph API.", 
@@ -272,57 +328,136 @@ namespace MailArchiver.Services.Providers.Graph
         }
 
         /// <summary>
-        /// Restores attachments for a newly created message.
+        /// Restores attachments for a newly created message. Attachments up to
+        /// <see cref="SimpleAttachmentMaxBytes"/> are posted directly; larger ones go through an
+        /// upload session, which Graph requires above roughly 3 MB. Before this, every large
+        /// attachment failed with a 413 that was only logged, and the message was still reported
+        /// as successfully restored.
         /// </summary>
-        private async Task RestoreAttachmentsAsync(
+        /// <returns>True only if every attachment was restored.</returns>
+        private async Task<bool> RestoreAttachmentsAsync(
             GraphServiceClient graphClient,
             ArchivedEmail email,
             MailAccount targetAccount,
             string messageId)
         {
-            try
+            foreach (var attachment in email.Attachments!)
             {
-                foreach (var attachment in email.Attachments!)
+                try
                 {
-                    try
+                    var content = attachment.Content;
+                    var contentId = NormalizeContentId(attachment.ContentId);
+
+                    if (RequiresUploadSession(content.LongLength))
+                    {
+                        await UploadLargeAttachmentAsync(graphClient, targetAccount, messageId, attachment, content, contentId);
+                    }
+                    else
                     {
                         var fileAttachment = new Microsoft.Graph.Models.FileAttachment
                         {
                             OdataType = "#microsoft.graph.fileAttachment",
                             Name = attachment.FileName,
                             ContentType = attachment.ContentType,
-                            ContentBytes = attachment.Content
+                            ContentBytes = content,
+                            ContentId = contentId
                         };
-
-                        if (!string.IsNullOrEmpty(attachment.ContentId))
-                        {
-                            var contentId = attachment.ContentId;
-                            if (contentId.StartsWith("<") && contentId.EndsWith(">"))
-                            {
-                                contentId = contentId.Trim('<', '>');
-                            }
-                            fileAttachment.ContentId = contentId;
-                        }
 
                         await graphClient.Users[targetAccount.EmailAddress]
                             .Messages[messageId]
                             .Attachments
                             .PostAsync(fileAttachment);
+                    }
 
-                        _logger.LogInformation("Successfully restored attachment {AttachmentName} for email {EmailId}",
-                            attachment.FileName, email.Id);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Error restoring attachment {AttachmentName} for email {EmailId}",
-                            attachment.FileName, email.Id);
-                    }
+                    _logger.LogInformation("Successfully restored attachment {AttachmentName} ({Size} bytes) for email {EmailId}",
+                        attachment.FileName, content.LongLength, email.Id);
                 }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error restoring attachment {AttachmentName} for email {EmailId}; the message is rolled back",
+                        attachment.FileName, email.Id);
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Uploads one attachment through a Graph upload session in
+        /// <see cref="UploadSliceSize"/> chunks.
+        /// </summary>
+        private async Task UploadLargeAttachmentAsync(
+            GraphServiceClient graphClient,
+            MailAccount targetAccount,
+            string messageId,
+            EmailAttachment attachment,
+            byte[] content,
+            string? contentId)
+        {
+            var requestBody = new CreateUploadSessionPostRequestBody
+            {
+                AttachmentItem = new AttachmentItem
+                {
+                    AttachmentType = AttachmentType.File,
+                    Name = attachment.FileName,
+                    ContentType = attachment.ContentType,
+                    Size = content.LongLength,
+                    ContentId = contentId
+                }
+            };
+
+            var uploadSession = await graphClient.Users[targetAccount.EmailAddress]
+                .Messages[messageId]
+                .Attachments
+                .CreateUploadSession
+                .PostAsync(requestBody);
+
+            if (uploadSession == null)
+            {
+                throw new InvalidOperationException($"Graph returned no upload session for attachment '{attachment.FileName}'.");
+            }
+
+            using var stream = new MemoryStream(content, writable: false);
+            var uploadTask = new LargeFileUploadTask<Microsoft.Graph.Models.FileAttachment>(
+                uploadSession, stream, UploadSliceSize, graphClient.RequestAdapter);
+
+            var result = await uploadTask.UploadAsync();
+            if (!result.UploadSucceeded)
+            {
+                throw new InvalidOperationException($"Upload session for attachment '{attachment.FileName}' did not complete.");
+            }
+        }
+
+        /// <summary>
+        /// Deletes a message whose attachments could not all be restored. Failure to delete is
+        /// logged loudly because it leaves an incomplete copy in the target mailbox.
+        /// </summary>
+        private async Task DeletePartialMessageAsync(
+            GraphServiceClient graphClient,
+            MailAccount targetAccount,
+            string messageId,
+            int emailId)
+        {
+            try
+            {
+                await graphClient.Users[targetAccount.EmailAddress].Messages[messageId].DeleteAsync();
+                _logger.LogWarning("Rolled back partially restored message for email {EmailId}", emailId);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error restoring attachments for email {EmailId}", email.Id);
+                _logger.LogError(ex,
+                    "Could not roll back partially restored message {MessageId} for email {EmailId}; an incomplete copy remains in {Mailbox}",
+                    messageId, emailId, targetAccount.EmailAddress);
             }
+        }
+
+        /// <summary>Strips the angle brackets Graph does not accept around a Content-ID.</summary>
+        internal static string? NormalizeContentId(string? contentId)
+        {
+            if (string.IsNullOrWhiteSpace(contentId)) return null;
+            var trimmed = contentId.Trim();
+            return trimmed.StartsWith("<") && trimmed.EndsWith(">") ? trimmed.Trim('<', '>') : trimmed;
         }
 
         /// <summary>

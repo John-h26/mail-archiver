@@ -1212,6 +1212,19 @@ namespace MailArchiver.Services.Providers.Imap
                     message.MessageId = restorableMessageId;
                 }
 
+                // Re-emit the conversation headers so restored replies stay threaded in the
+                // target client. They have no column of their own and only survive in RawHeaders.
+                var threading = ThreadingHeaders.Extract(email.RawHeaders);
+                if (threading.InReplyTo != null)
+                {
+                    message.Headers.Replace(HeaderId.InReplyTo, $"<{threading.InReplyTo}>");
+                }
+                if (threading.References.Count > 0)
+                {
+                    message.Headers.Replace(HeaderId.References,
+                        string.Join(" ", threading.References.Select(id => $"<{id}>")));
+                }
+
                 return message;
             }
             catch (Exception ex)
