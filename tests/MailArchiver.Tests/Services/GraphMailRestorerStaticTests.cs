@@ -78,11 +78,37 @@ public class GraphMailRestorerStaticTests
         Assert.Equal("2026-07-12T09:00:00.000Z", restorer.ResolveDeliveryTimeUtcIso8601(email));
     }
 
+    [Theory]
+    [InlineData("INBOX", "Boîte de réception", "Boîte de réception")]
+    [InlineData("inbox/Projets/2026", "Boîte de réception", "Boîte de réception/Projets/2026")]
+    [InlineData("Sent Items", "Inbox", "Sent Items")]
+    [InlineData("Archive/INBOX", "Inbox", "Archive/INBOX")]
+    [InlineData("INBOX/Sub", null, "INBOX/Sub")]
+    [InlineData(" INBOX \\ Sub ", "Posteingang", "Posteingang/Sub")]
+    [InlineData("", "Inbox", "")]
+    public void MapInboxRoot_MapsOnlyALeadingInboxSegment(string path, string? inboxName, string expected)
+    {
+        Assert.Equal(expected, GraphMailRestorer.MapInboxRoot(path, inboxName));
+    }
+
+    [Theory]
+    [InlineData("INBOX", true)]
+    [InlineData("inbox", true)]
+    [InlineData("/INBOX/", true)]
+    [InlineData("INBOX/Sub", false)]
+    [InlineData("Archive", false)]
+    [InlineData(null, false)]
+    public void IsInboxRootOnly_RecognisesTheBareInbox(string? path, bool expected)
+    {
+        Assert.Equal(expected, GraphMailRestorer.IsInboxRootOnly(path));
+    }
+
     private static GraphMailRestorer CreateRestorer(string timeZoneId) => new(
         authFactory: null!,
         folderService: null!,
         context: null!,
         NullLogger<GraphMailRestorer>.Instance,
         new DateTimeHelper(Options.Create(new TimeZoneOptions { DisplayTimeZoneId = timeZoneId })),
-        Options.Create(new OffloadOptions()));
+        Options.Create(new OffloadOptions()),
+        Options.Create(new BatchOperationOptions()));
 }

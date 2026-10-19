@@ -15,7 +15,8 @@ namespace MailArchiver.Services.Shared
         SameAsSource,
         NotFound,
         NotAccessible,
-        NotImap,
+        /// <summary>The target provider cannot receive an offload (only IMAP and M365 can).</summary>
+        UnsupportedProvider,
     }
 
     /// <summary>The facts about a candidate target that decide whether it may be used.</summary>
@@ -64,9 +65,16 @@ namespace MailArchiver.Services.Shared
             if (target == null) return OffloadTargetRejection.NotFound;
             if (target.Id == sourceAccountId) return OffloadTargetRejection.SameAsSource;
             if (!target.IsAccessible) return OffloadTargetRejection.NotAccessible;
-            if (target.Provider != ProviderType.IMAP) return OffloadTargetRejection.NotImap;
+            if (!IsSupportedProvider(target.Provider)) return OffloadTargetRejection.UnsupportedProvider;
             return OffloadTargetRejection.None;
         }
+
+        /// <summary>
+        /// Providers an offload can write into: IMAP through APPEND, and M365 through Microsoft
+        /// Graph. MSA and import-only accounts are not offload targets.
+        /// </summary>
+        public static bool IsSupportedProvider(ProviderType provider)
+            => provider == ProviderType.IMAP || provider == ProviderType.M365;
 
         public static bool IsEligible(OffloadTargetCandidate? target, int sourceAccountId)
             => Evaluate(target, sourceAccountId) == OffloadTargetRejection.None;
@@ -80,7 +88,7 @@ namespace MailArchiver.Services.Shared
             OffloadTargetRejection.SameAsSource => "OffloadTargetMustDiffer",
             OffloadTargetRejection.NotFound => "OffloadTargetNotFound",
             OffloadTargetRejection.NotAccessible => "OffloadTargetNotFound",
-            OffloadTargetRejection.NotImap => "OffloadTargetMustBeImap",
+            OffloadTargetRejection.UnsupportedProvider => "OffloadTargetUnsupportedProvider",
             _ => throw new ArgumentOutOfRangeException(nameof(rejection), rejection, "No message for an accepted target."),
         };
     }

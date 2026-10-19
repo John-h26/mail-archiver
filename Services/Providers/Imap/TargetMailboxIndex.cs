@@ -200,22 +200,64 @@ namespace MailArchiver.Services.Providers.Imap
                 var envelope = summary.Envelope;
                 if (envelope == null) continue;
 
-                IndexedMessages++;
-
-                var messageIdKey = MailMatchKey.MessageIdKey(envelope.MessageId);
-                if (messageIdKey.HasValue)
-                {
-                    _messageIdKeys.Add(messageIdKey.Value);
-                }
-
-                AddFingerprint(
-                    MailMatchKey.FingerprintKeyFromAddresses(
-                        envelope.From?.Mailboxes.Select(m => m.Address),
-                        envelope.To?.Mailboxes.Select(m => m.Address),
-                        envelope.Subject),
-                    TimestampForEnvelope(envelope.Date, summary.InternalDate));
+                AddEnvelope(
+                    envelope.MessageId,
+                    envelope.From?.Mailboxes.Select(m => m.Address),
+                    envelope.To?.Mailboxes.Select(m => m.Address),
+                    envelope.Subject,
+                    envelope.Date,
+                    summary.InternalDate);
             }
         }
+
+        /// <summary>
+        /// Creates an empty index for a builder that reads the target mailbox through another
+        /// protocol (Microsoft Graph). The match logic is the same for every provider; only the
+        /// way the index is filled differs.
+        /// </summary>
+        internal static TargetMailboxIndex CreateEmpty(DateTimeHelper dateTimeHelper) => new(dateTimeHelper);
+
+        /// <summary>
+        /// Indexes one message of the target mailbox from wire values: its Message-ID, its
+        /// sender and recipient addresses, its subject, and its send time with the delivery time
+        /// as fallback. Shared by the IMAP ENVELOPE path and the Graph path so both feed exactly
+        /// the same criteria.
+        /// </summary>
+        internal void AddEnvelope(
+            string? messageId,
+            IEnumerable<string>? fromAddresses,
+            IEnumerable<string>? toAddresses,
+            string? subject,
+            DateTimeOffset? sentDate,
+            DateTimeOffset? deliveryDate)
+        {
+            IndexedMessages++;
+
+            var messageIdKey = MailMatchKey.MessageIdKey(messageId);
+            if (messageIdKey.HasValue)
+            {
+                _messageIdKeys.Add(messageIdKey.Value);
+            }
+
+            AddFingerprint(
+                MailMatchKey.FingerprintKeyFromAddresses(fromAddresses, toAddresses, subject),
+                TimestampForEnvelope(sentDate, deliveryDate));
+        }
+
+        /// <summary>Counts a folder as read into the index.</summary>
+        internal void CountFolder() => IndexedFolders++;
+
+        /// <summary>
+        /// Records that the index covers less than the whole target mailbox, so the outcome can
+        /// warn that a repeated run may duplicate mail.
+        /// </summary>
+        internal void MarkScopeReduced() => ScopeReduced = true;
+
+        /// <summary>Number of distinct Message-ID keys, for the build log line.</summary>
+        internal int MessageIdKeyCount => _messageIdKeys.Count;
+
+        /// <summary>Number of distinct fingerprints, for the build log line.</summary>
+        internal int FingerprintCount => _fingerprints.Count;
 
         /// <summary>
         /// Converts an envelope date into the form <c>ArchivedEmail.SentDate</c> is stored in.

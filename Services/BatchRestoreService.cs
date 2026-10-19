@@ -254,9 +254,10 @@ namespace MailArchiver.Services
                 var imapEmailService = scope.ServiceProvider.GetRequiredService<MailArchiver.Services.Providers.ImapEmailService>();
                 var providerEmailService = scope.ServiceProvider.GetRequiredService<IProviderEmailService>();
                 var dbContext = scope.ServiceProvider.GetRequiredService<MailArchiverDbContext>();
+                var graphRestorer = scope.ServiceProvider.GetRequiredService<MailArchiver.Services.Providers.Graph.GraphMailRestorer>();
 
                 // Verarbeite in Batches mit Progress-Updates
-                await ProcessJobWithProgress(job, imapEmailService, providerEmailService, dbContext, cancellationToken);
+                await ProcessJobWithProgress(job, imapEmailService, providerEmailService, graphRestorer, dbContext, cancellationToken);
 
                 if (job.Status != BatchRestoreJobStatus.Cancelled)
                 {
@@ -339,6 +340,7 @@ namespace MailArchiver.Services
             BatchRestoreJob job,
             MailArchiver.Services.Providers.ImapEmailService imapEmailService,
             IProviderEmailService providerEmailService,
+            MailArchiver.Services.Providers.Graph.GraphMailRestorer graphRestorer,
             MailArchiverDbContext dbContext,
             CancellationToken cancellationToken)
         {
@@ -403,17 +405,7 @@ namespace MailArchiver.Services
                             job.EmailIds, job.TargetAccountId, job.TargetFolder,
                             job.PreserveFolderStructure, job.Offload!, progressCallback, cancellationToken);
 
-                        job.AppendedCount = outcome.Appended;
-                        job.SkippedAlreadyPresentCount = outcome.SkippedAlreadyPresent;
-                        job.MatchedByFingerprintCount = outcome.MatchedByFingerprint;
-                        job.SkippedExcludedFolderCount = outcome.SkippedExcludedFolder;
-                        job.SuccessCount = outcome.Appended;
-                        job.FailedCount = outcome.Failed;
-                        job.ProcessedCount = outcome.Considered;
-                        job.Report = outcome.Describe();
-
-                        _logger.LogInformation("Job {JobId}: offload completed. {Report}",
-                            job.JobId, job.Report.Replace(Environment.NewLine, " | "));
+                        ApplyOffloadOutcome(job, outcome);
                         return;
                     }
 
@@ -433,6 +425,23 @@ namespace MailArchiver.Services
                     job.FailedCount = job.EmailIds.Count;
                     job.ProcessedCount = job.EmailIds.Count;
                 }
+            }
+            else if (job.IsOffload)
+            {
+                // M365 offload: one pass with a duplicate index over the whole target mailbox,
+                // built once. Batching happens inside the restorer, which also owns the pauses.
+                Action<int, int, int> progressCallback = (processed, successful, failed) =>
+                {
+                    job.ProcessedCount = processed;
+                    job.SuccessCount = successful;
+                    job.FailedCount = failed;
+                };
+
+                var outcome = await graphRestorer.OffloadEmailsAsync(
+                    job.EmailIds, job.TargetAccountId, job.TargetFolder,
+                    job.PreserveFolderStructure, job.Offload!, progressCallback, cancellationToken);
+
+                ApplyOffloadOutcome(job, outcome);
             }
             else
             {
@@ -507,6 +516,22 @@ namespace MailArchiver.Services
 
             _logger.LogInformation("Job {JobId}: Batch restore completed. Total: {Total}, Success: {Success}, Failed: {Failed}",
                 job.JobId, totalEmails, job.SuccessCount, job.FailedCount);
+        }
+
+        /// <summary>Copies an offload outcome onto the job, whichever provider produced it.</summary>
+        private void ApplyOffloadOutcome(BatchRestoreJob job, OffloadOutcome outcome)
+        {
+            job.AppendedCount = outcome.Appended;
+            job.SkippedAlreadyPresentCount = outcome.SkippedAlreadyPresent;
+            job.MatchedByFingerprintCount = outcome.MatchedByFingerprint;
+            job.SkippedExcludedFolderCount = outcome.SkippedExcludedFolder;
+            job.SuccessCount = outcome.Appended;
+            job.FailedCount = outcome.Failed;
+            job.ProcessedCount = outcome.Considered;
+            job.Report = outcome.Describe();
+
+            _logger.LogInformation("Job {JobId}: offload completed. {Report}",
+                job.JobId, job.Report.Replace(Environment.NewLine, " | "));
         }
 
         public override void Dispose()

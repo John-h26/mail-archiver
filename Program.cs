@@ -837,10 +837,10 @@ if (cliArgs.Any(a => a == "--offload"))
             Console.WriteLine($"ERROR: target account {targetAccountId} not found");
             Environment.Exit(ExitBadArgs);
         }
-        if (targetAccount!.Provider != ProviderType.IMAP)
+        if (!MailArchiver.Services.Shared.OffloadTargetEligibility.IsSupportedProvider(targetAccount!.Provider))
         {
             Console.WriteLine($"ERROR: target account '{targetAccount.Name}' is a {targetAccount.Provider} account; " +
-                              "offload targets must be IMAP");
+                              "offload targets must be IMAP or M365");
             Environment.Exit(ExitBadArgs);
         }
         // A disabled target is accepted here as it is in the UI and the queued job path: IsEnabled
@@ -899,19 +899,22 @@ if (cliArgs.Any(a => a == "--offload"))
             Environment.Exit(ExitBadArgs);
         }
 
-        var imapService = offloadServices.GetRequiredService<MailArchiver.Services.Providers.ImapEmailService>();
-
         var lastReported = 0;
-        var outcome = await imapService.OffloadEmailsAsync(
-            emailIds, targetAccountId, targetFolder, preserveFolders, criteria,
-            (processed, appended, failed) =>
-            {
-                // One line per hundred keeps a multi-hour run readable in a log file.
-                if (processed - lastReported < 100 && processed != emailIds.Count) return;
-                lastReported = processed;
-                Console.WriteLine($"  {processed}/{emailIds.Count} processed, {appended} appended, {failed} failed");
-            },
-            CancellationToken.None);
+        Action<int, int, int> reportProgress = (processed, appended, failed) =>
+        {
+            // One line per hundred keeps a multi-hour run readable in a log file.
+            if (processed - lastReported < 100 && processed != emailIds.Count) return;
+            lastReported = processed;
+            Console.WriteLine($"  {processed}/{emailIds.Count} processed, {appended} appended, {failed} failed");
+        };
+
+        var outcome = targetAccount.Provider == ProviderType.M365
+            ? await offloadServices.GetRequiredService<MailArchiver.Services.Providers.Graph.GraphMailRestorer>()
+                .OffloadEmailsAsync(emailIds, targetAccountId, targetFolder, preserveFolders, criteria,
+                    reportProgress, CancellationToken.None)
+            : await offloadServices.GetRequiredService<MailArchiver.Services.Providers.ImapEmailService>()
+                .OffloadEmailsAsync(emailIds, targetAccountId, targetFolder, preserveFolders, criteria,
+                    reportProgress, CancellationToken.None);
 
         Console.WriteLine();
         Console.Write(outcome.Describe());

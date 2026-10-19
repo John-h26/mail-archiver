@@ -113,9 +113,30 @@ The job is queued and its progress and per-folder report appear on the job statu
 **Jobs**. The per-folder report names source folders, so it is shown only to the user who started
 the job and to administrators.
 
-The target mailbox may be a disabled IMAP account, e.g. to provision a migration target before it
-goes live; the run fails loudly on connect if the target is unreachable. Microsoft 365 accounts
-cannot be offload targets; the Graph restore path is unchanged.
+The target mailbox may be a disabled IMAP or Microsoft 365 account, e.g. to provision a migration
+target before it goes live; the run fails loudly on connect if the target is unreachable.
+
+### Offloading into Microsoft 365
+
+A Microsoft 365 account can be an offload target as well. The run behaves exactly like the IMAP
+one (window, exclusions, renames, dry run, duplicate index over the whole target mailbox), with
+three differences that follow from Microsoft Graph:
+
+- **Duplicate index.** Every folder of the target mailbox is read through Graph, selecting only
+  `internetMessageId`, sender, recipients, subject and the two timestamps, in pages of 999. A
+  mailbox of 100,000 messages costs about a hundred requests and no message body is transferred.
+- **Inbox.** A target path starting with `INBOX` is mapped onto the mailbox's real Inbox, whatever
+  its localised display name ("Boîte de réception", "Posteingang"), instead of creating a second
+  folder literally named `INBOX`. Other well-known folders are matched by display name, so use the
+  rename map for them, e.g. `"Sent": "Sent Items"` or `"Sent": "Éléments envoyés"` for a French
+  mailbox.
+- **Attachments.** Attachments above 3 MB are uploaded through an upload session. A message whose
+  attachments cannot all be uploaded is removed again and counted as failed, so a repeated run
+  re-creates it completely.
+
+The app registration needs the `Mail.ReadWrite` application permission on the target mailbox.
+Graph throttling (HTTP 429) is retried automatically with the `Retry-After` delay Microsoft sends;
+`BatchOperation:PauseBetweenEmailsMs` adds a pause between messages on top of that.
 
 ### Who may run it
 
@@ -143,7 +164,7 @@ docker compose exec mailarchive-app dotnet MailArchiver.dll \
 | Argument | Meaning |
 |---|---|
 | `--source-account-id` | Account to read archived mail from. Required. |
-| `--target-account-id` | IMAP account to append into. Required, and must differ from the source. |
+| `--target-account-id` | IMAP or Microsoft 365 account to append into. Required, and must differ from the source. |
 | `--since` | Inclusive lower bound on the send date, `YYYY-MM-DD`. Required. |
 | `--until` | Optional inclusive upper bound. |
 | `--target-folder` | Root folder in the target mailbox. Defaults to `INBOX`. |
@@ -157,7 +178,7 @@ Exit codes:
 |---|---|
 | `0` | Everything was appended or already present. |
 | `1` | At least one message failed, or the run itself failed. |
-| `2` | The invocation was wrong: bad or missing arguments, unknown account, target not IMAP, source equal to target. |
+| `2` | The invocation was wrong: bad or missing arguments, unknown account, target neither IMAP nor Microsoft 365, source equal to target. |
 
 One invocation handles one mailbox, which makes a fleet of mailboxes scriptable from a CSV of
 source, target and cutoff.
@@ -219,13 +240,16 @@ run may append mail that is already present in the parts that were not indexed.
 
 ## ⚠️ Notes and limits
 
-- Restored mail now carries its **original delivery time** as the IMAP internal date, taken from
+- Restored mail now carries its **original delivery time** (the IMAP internal date, or
+  `PidTagMessageDeliveryTime` in Microsoft 365), taken from
   the message's `Received` chain and falling back to the send date. It previously carried the
   time of the archiving run, which broke server side sorting by arrival and any age based rule on
   the target.
 - Because a repeated run skips what is already present, a wrong internal date cannot be corrected
   by re-running: the messages are recognised and skipped. Get this right before a production run,
   or delete the affected messages on the target and run again.
-- Microsoft 365 is not supported as an offload target.
+- In Microsoft 365 the message is rebuilt from the archive through Graph, so conversation
+  headers (`In-Reply-To`, `References`) cannot be set; conversation grouping in the target relies
+  on what Exchange derives on its own.
 - Duplicate detection can only recognise what it can see in the target mailbox. Mail that reached
   the target by some other route is caught only insofar as the two criteria happen to match it.

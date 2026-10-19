@@ -698,30 +698,10 @@ namespace MailArchiver.Services.Providers.Imap
                 .Select(e => new { e.Id, e.FolderName })
                 .ToListAsync(cancellationToken);
 
-            // Group by the target path AFTER the rename. Keying on the raw source name would
-            // open the same target folder twice when two source folders legitimately collapse
-            // onto one, for example "Sent Items" and "Sent" both becoming "Sent".
-            var groups = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var row in rows)
-            {
-                var source = row.FolderName ?? "INBOX";
-
-                if (FolderMapper.IsExcluded(source, criteria.ExcludedSourceFolders))
-                {
-                    outcome.SkippedExcludedFolder++;
-                    continue;
-                }
-
-                var renamed = FolderMapper.ApplyRenameMap(source, criteria.FolderRenameMap);
-                var targetPath = FolderMapper.ResolveTargetPath(renamed, baseFolderName, preserveFolderStructure);
-
-                if (!groups.TryGetValue(targetPath, out var list))
-                {
-                    list = new List<int>();
-                    groups[targetPath] = list;
-                }
-                list.Add(row.Id);
-            }
+            var groups = OffloadPlanner.GroupByTargetPath(
+                rows.Select(r => (r.Id, (string?)r.FolderName)),
+                baseFolderName, preserveFolderStructure, criteria, out var excludedCount);
+            outcome.SkippedExcludedFolder = excludedCount;
 
             _logger.LogInformation(
                 "Offload to account {AccountName}: {Considered} mails in {Groups} target folders, " +

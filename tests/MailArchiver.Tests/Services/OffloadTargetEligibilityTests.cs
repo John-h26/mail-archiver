@@ -73,11 +73,22 @@ public class OffloadTargetEligibilityTests
         Assert.Equal(OffloadTargetRejection.NotAccessible, OffloadTargetEligibility.Evaluate(foreign, SourceId));
     }
 
-    [Fact]
-    public void Evaluate_AGraphAccount_IsRejected()
+    [Theory]
+    [InlineData(ProviderType.IMAP)]
+    [InlineData(ProviderType.M365)]
+    public void Evaluate_ImapAndM365Accounts_AreAccepted(ProviderType provider)
     {
-        var graph = Candidate(provider: ProviderType.M365);
-        Assert.Equal(OffloadTargetRejection.NotImap, OffloadTargetEligibility.Evaluate(graph, SourceId));
+        var candidate = Candidate(provider: provider);
+        Assert.Equal(OffloadTargetRejection.None, OffloadTargetEligibility.Evaluate(candidate, SourceId));
+    }
+
+    [Theory]
+    [InlineData(ProviderType.MSA)]
+    [InlineData(ProviderType.IMPORT)]
+    public void Evaluate_OtherProviders_AreRejected(ProviderType provider)
+    {
+        var candidate = Candidate(provider: provider);
+        Assert.Equal(OffloadTargetRejection.UnsupportedProvider, OffloadTargetEligibility.Evaluate(candidate, SourceId));
     }
 
     /// <summary>
@@ -87,6 +98,7 @@ public class OffloadTargetEligibilityTests
     [Theory]
     [InlineData(ProviderType.M365)]
     [InlineData(ProviderType.IMAP)]
+    [InlineData(ProviderType.MSA)]
     public void Evaluate_InaccessibleWins_OverTheProvider(ProviderType provider)
     {
         var candidate = Candidate(provider: provider, isAccessible: false);
@@ -122,7 +134,7 @@ public class OffloadTargetEligibilityTests
     [InlineData(OffloadTargetRejection.SameAsSource, "OffloadTargetMustDiffer")]
     [InlineData(OffloadTargetRejection.NotFound, "OffloadTargetNotFound")]
     [InlineData(OffloadTargetRejection.NotAccessible, "OffloadTargetNotFound")]
-    [InlineData(OffloadTargetRejection.NotImap, "OffloadTargetMustBeImap")]
+    [InlineData(OffloadTargetRejection.UnsupportedProvider, "OffloadTargetUnsupportedProvider")]
     public void MessageKey_MapsEveryRejection(OffloadTargetRejection rejection, string expected)
     {
         Assert.Equal(expected, OffloadTargetEligibility.MessageKey(rejection));
